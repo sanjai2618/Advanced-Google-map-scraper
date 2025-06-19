@@ -1,0 +1,779 @@
+import re
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from webdriver_manager.chrome import ChromeDriverManager
+import time
+import urllib.parse
+from selenium.common.exceptions import StaleElementReferenceException, NoSuchElementException
+import random
+import os
+
+
+def setup_driver():
+    edge_options = Options()
+
+    # Anti-detection measures
+    edge_options.add_argument("--disable-blink-features=AutomationControlled")
+    edge_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    edge_options.add_experimental_option('useAutomationExtension', False)
+
+    # User agent rotation
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0'
+    ]
+    edge_options.add_argument(f'--user-agent={random.choice(user_agents)}')
+
+    # Performance optimizations and disable images
+    prefs = {
+        "profile.default_content_setting_values.notifications": 2,  # Block notifications
+        "profile.managed_default_content_settings.media_stream": 2,  # Block media
+        "profile.default_content_settings.popups": 0,
+        "profile.managed_default_content_settings.images": 2,  # Block images
+        "profile.default_content_setting_values.images": 2,  # Block images
+    }
+    edge_options.add_experimental_option("prefs", prefs)
+
+    # Additional performance optimizations
+    edge_options.add_argument("--disable-images")
+    edge_options.add_argument("--disable-dev-shm-usage")
+    edge_options.add_argument("--no-sandbox")
+    edge_options.add_argument("--disable-gpu")
+    edge_options.add_argument("--disable-web-security")
+    edge_options.add_argument("--allow-running-insecure-content")
+    edge_options.add_argument("--disable-javascript")  # Disable unnecessary JS
+    edge_options.add_argument("--disable-plugins")
+    edge_options.add_argument("--disable-extensions")
+
+    # Window size to appear more human
+    edge_options.add_argument("--window-size=1920,1080")
+    edge_options.add_argument("--start-maximized")
+
+    # Uncomment to run headless (but this might increase detection)
+    edge_options.add_argument("--headless")
+
+    driver = webdriver.Edge(options=edge_options)
+
+    # Execute script to remove webdriver property
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    return driver
+
+
+def clean_address(address_text):
+    """Clean and extract proper address from raw text."""
+    if not address_text:
+        return ""
+
+    # Remove common unwanted patterns
+    unwanted_patterns = [
+        r'\b(closed|open|opens|closes|hours?|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.*',
+        r'\b\d{1,2}:\d{2}\s*(am|pm|AM|PM).*',  # Remove time patterns
+        r'\bphone:.*',
+        r'\btel:.*',
+        r'\bemail:.*',
+        r'\bwebsite:.*',
+        r'\brating:.*',
+        r'\breviews?:.*',
+        r'\b\d+\.\d+\s*stars?.*',
+        r'\b(call|visit|directions|share|save|suggest|edit)\b.*',
+        r'\b(⭐|★).*',  # Remove star ratings
+        r'\b\d+\s*reviews?.*',
+        r'\bpermanently closed.*',
+        r'\btemporarily closed.*',
+        r'\bmight be closed.*',
+        r'\bverify hours.*',
+    ]
+
+    # Clean the address
+    cleaned = address_text.strip()
+
+    # Remove unwanted patterns
+    for pattern in unwanted_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE).strip()
+
+    # Remove extra whitespace and newlines
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+
+    # Remove leading/trailing punctuation
+    cleaned = re.sub(r'^[^\w]+|[^\w]+$', '', cleaned)
+
+    # Split by common separators and take the longest meaningful part
+    parts = re.split(r'[•·|]', cleaned)
+    if len(parts) > 1:
+        # Find the part that looks most like an address
+        address_parts = []
+        for part in parts:
+            part = part.strip()
+            if (len(part) > 10 and
+                    any(keyword in part.lower() for keyword in
+                        ['road', 'street', 'rd', 'st', 'avenue', 'ave', 'main', 'complex', 'plaza', 'building', 'nagar',
+                         'colony', 'layout']) and
+                    not any(bad_keyword in part.lower() for bad_keyword in
+                            ['phone', 'call', 'visit', 'hour', 'minute', 'rating', 'star', 'review'])):
+                address_parts.append(part)
+
+        if address_parts:
+            # Take the longest address part
+            cleaned = max(address_parts, key=len)
+
+    return cleaned.strip()
+
+
+def extract_business_data_from_container(container, debug=False):
+    """Extract business data from a business container element."""
+    try:
+        business_data = {
+            'title': '',
+            'rating': '0',
+            'review_count': '0',
+            'phone': '',
+            'industry': '',
+            'address': '',
+            'company_url': '',
+            'google_maps_link': ''
+        }
+
+        # Extract Google Maps link
+        try:
+            link_element = container.find_element(By.CSS_SELECTOR, 'a.hfpxzc')
+            business_data['google_maps_link'] = link_element.get_attribute('href')
+        except:
+            pass
+
+        # Extract title
+        try:
+            title_selectors = [
+                '.fontHeadlineSmall',
+                '[data-value="title"]',
+                '.qBF1Pd',
+                '.fontHeadlineLarge'
+            ]
+            for selector in title_selectors:
+                try:
+                    title_element = container.find_element(By.CSS_SELECTOR, selector)
+                    business_data['title'] = title_element.text.strip()
+                    if business_data['title']:
+                        break
+                except:
+                    continue
+        except:
+            pass
+
+        # Extract rating and reviews
+        try:
+            rating_elements = container.find_elements(By.CSS_SELECTOR, '[role="img"]')
+            for rating_element in rating_elements:
+                aria_label = rating_element.get_attribute('aria-label')
+                if aria_label and 'stars' in aria_label.lower():
+                    # Parse rating from aria-label (e.g., "4.5 stars 123 reviews")
+                    parts = aria_label.split()
+                    if len(parts) >= 1:
+                        business_data['rating'] = parts[0]
+
+                    # Extract review count
+                    review_match = re.search(r'(\d+)\s+review', aria_label)
+                    if review_match:
+                        business_data['review_count'] = review_match.group(1)
+                    break
+        except:
+            pass
+
+        # Get container text for additional parsing
+        try:
+            container_text = container.text
+            if debug:
+                print(f"DEBUG - Container text for {business_data['title']}:")
+                print(repr(container_text[:500] + "..." if len(container_text) > 500 else container_text))
+                print("-" * 50)
+
+            # Extract phone number from container text
+            phone_patterns = [
+                r'(\+\d{1,2}\s)?\(?\d{3,5}\)?[\s.-]?\d{3,5}[\s.-]?\d{4,6}',
+                r'\d{3}-\d{3}-\d{4}',
+                r'\(\d{3}\)\s*\d{3}-\d{4}'
+            ]
+
+            for pattern in phone_patterns:
+                phone_match = re.search(pattern, container_text)
+                if phone_match:
+                    business_data['phone'] = phone_match.group(0).strip()
+                    break
+
+            # Split container text into lines for better parsing
+            lines = [line.strip() for line in container_text.split('\n') if line.strip()]
+
+            # Extract industry (business type)
+            for i, line in enumerate(lines):
+                # Look for industry indicators after title or rating
+                if (business_data['title'] and business_data['title'] in line) or (
+                        business_data['rating'] and business_data['rating'] in line):
+                    # Check next few lines for industry
+                    for j in range(i + 1, min(i + 4, len(lines))):
+                        potential_industry = lines[j]
+                        # Industry validation
+                        if (len(potential_industry) < 50 and
+                                not re.search(r'\d+.*\d+', potential_industry) and
+                                not any(keyword in potential_industry.lower() for keyword in
+                                        ['open', 'closed', 'hours', 'phone', 'call', 'visit', 'rating', 'review',
+                                         'directions']) and
+                                not re.search(r'\d{3,}', potential_industry)):  # No long numbers
+                            business_data['industry'] = re.sub(r'[·•]', '', potential_industry).strip()
+                            break
+                    if business_data['industry']:
+                        break
+
+            # Improved address extraction
+            address_candidates = []
+
+            # Method 1: Look for lines with address keywords
+            address_keywords = ['road', 'street', 'rd', 'st', 'avenue', 'ave', 'main', 'complex',
+                                'plaza', 'building', 'nagar', 'colony', 'layout', 'cross', 'lane',
+                                'bypass', 'opposite', 'opp', 'near', 'beside', 'behind']
+
+            for line in lines:
+                line_lower = line.lower()
+                if any(keyword in line_lower for keyword in address_keywords):
+                    address_candidates.append(line)
+
+            # Method 2: Look for lines with numbers and commas (typical address format)
+            for line in lines:
+                if (re.search(r'\d+[/,-]\d+', line) or  # Pattern like 30/51, 26/2/9
+                        re.search(r'\d+,\s*\w+', line) or  # Pattern like 65, Main St
+                        re.search(r'#\d+', line)):  # Pattern like #123
+                    address_candidates.append(line)
+
+            # Method 3: Look for lines that contain location indicators
+            for line in lines:
+                if (re.search(r'\b\d+[a-z]*\s+(road|rd|street|st|ave|avenue|main)', line, re.IGNORECASE) or
+                        re.search(r'opp\.|opposite|near|beside', line, re.IGNORECASE)):
+                    address_candidates.append(line)
+
+            # Choose the best address candidate
+            if address_candidates:
+                # Remove duplicates and clean
+                unique_candidates = list(set(address_candidates))
+
+                # Score candidates based on address-like features
+                scored_candidates = []
+                for candidate in unique_candidates:
+                    score = 0
+                    candidate_lower = candidate.lower()
+
+                    # Positive scoring
+                    if any(kw in candidate_lower for kw in address_keywords):
+                        score += 5
+                    if re.search(r'\d+[/,-]\d+', candidate):
+                        score += 3
+                    if 'opp' in candidate_lower or 'opposite' in candidate_lower:
+                        score += 2
+                    if len(candidate) > 15:  # Reasonable length
+                        score += 1
+
+                    # Negative scoring
+                    if any(bad_kw in candidate_lower for bad_kw in
+                           ['hour', 'open', 'closed', 'phone', 'call', 'rating', 'review']):
+                        score -= 10
+                    if len(candidate) > 150:  # Too long
+                        score -= 5
+
+                    scored_candidates.append((score, candidate))
+
+                # Get the highest scoring candidate
+                if scored_candidates:
+                    best_candidate = max(scored_candidates, key=lambda x: x[0])[1]
+                    business_data['address'] = clean_address(best_candidate)
+
+        except Exception as e:
+            if debug:
+                print(f"Error parsing container text: {e}")
+
+        # Extract website
+        try:
+            website_elements = container.find_elements(By.CSS_SELECTOR, 'a[href]')
+            for link in website_elements:
+                href = link.get_attribute('href')
+                if (href and
+                        not href.startswith('https://www.google.com/maps/') and
+                        not href.startswith('tel:') and
+                        not href.startswith('mailto:')):
+                    business_data['company_url'] = href
+                    break
+        except:
+            pass
+
+        return business_data
+
+    except Exception as e:
+        print(f"Error extracting business data from container: {e}")
+        return None
+
+
+def extract_location_from_url(url):
+    """Extract just the location name from Google Maps search URL for filename."""
+    try:
+        # Parse the URL
+        parsed_url = urllib.parse.urlparse(url)
+        query = parsed_url.path.split('/')[-1]  # Get the search query part
+
+        # Decode URL encoding
+        decoded_query = urllib.parse.unquote(query)
+
+        print(f"🔍 Extracting location from: {decoded_query}")
+
+        # Extract location-related keywords - prioritize exact location extraction
+        location_patterns = [
+            r'in\s+([a-zA-Z\s]+?)(?:\+|$)',  # "in salem" -> "salem"
+            r'near\s+([a-zA-Z\s]+?)(?:\+|$)',  # "near chennai" -> "chennai"
+            r'at\s+([a-zA-Z\s]+?)(?:\+|$)',  # "at coimbatore" -> "coimbatore"
+            r'([a-zA-Z\s]+?)\s+(?:city|town|district)(?:\+|$)',  # "salem city" -> "salem"
+        ]
+
+        for pattern in location_patterns:
+            match = re.search(pattern, decoded_query, re.IGNORECASE)
+            if match:
+                location = match.group(1).strip()
+                # Clean the location name
+                location = re.sub(r'[^\w\s]', '', location)
+                location = re.sub(r'\s+', '_', location)  # Replace spaces with underscores
+                if len(location) > 2:  # Must be reasonable length
+                    clean_location = location.lower()
+                    print(f"✅ Extracted location: {clean_location}")
+                    return clean_location
+
+        # If no "in/near/at" pattern found, try to extract the last meaningful word
+        # Split by + and look for location-like words at the end
+        parts = decoded_query.split('+')
+        if len(parts) >= 2:
+            # Look at the last few parts for location names
+            for i in range(len(parts) - 1, max(0, len(parts) - 4), -1):
+                potential_location = parts[i].strip()
+                # Check if it looks like a location (not a business type)
+                if (len(potential_location) > 2 and
+                        not any(business_word in potential_location.lower() for business_word in
+                                ['shop', 'store', 'restaurant', 'hotel', 'hospital', 'school', 'college',
+                                 'bank', 'atm', 'clinic', 'pharmacy', 'temple', 'mall', 'market']) and
+                        re.match(r'^[a-zA-Z\s]+$', potential_location)):  # Only letters and spaces
+
+                    clean_location = re.sub(r'[^\w]', '', potential_location).lower()
+                    print(f"✅ Extracted location from parts: {clean_location}")
+                    return clean_location
+
+        # If still no location found, use a generic name based on search terms
+        search_terms = decoded_query.replace('+', '_').replace('%20', '_')
+        search_terms = re.sub(r'[^\w]', '_', search_terms)
+        fallback_name = search_terms[:30].lower()  # Limit length
+        print(f"⚠️ Using fallback name: {fallback_name}")
+        return fallback_name
+
+    except Exception as e:
+        print(f"❌ Error extracting location from URL: {e}")
+        return "google_maps_data"
+
+
+def fast_scroll_to_end(driver, max_scrolls=100):
+    """Fast scroll to the end to load all containers first."""
+    print("🚀 Fast scrolling to load all results...")
+
+    # Find the scrollable container
+    scrollable_container = None
+    container_selectors = [
+        "div[role='feed']",
+        "div[role='main']",
+        ".m6QErb",
+        "[aria-label*='Results']",
+        "div[data-value='feed']"
+    ]
+
+    for selector in container_selectors:
+        try:
+            scrollable_container = driver.find_element(By.CSS_SELECTOR, selector)
+            print(f"Found scrollable container with selector: {selector}")
+            break
+        except:
+            continue
+
+    if not scrollable_container:
+        print("Could not find scrollable container, using page body")
+        scrollable_container = driver.find_element(By.TAG_NAME, "body")
+
+    scroll_count = 0
+    no_change_count = 0
+    last_height = 0
+
+    while scroll_count < max_scrolls and no_change_count < 5:
+        try:
+            # Fast scroll - larger jumps
+            driver.execute_script("""
+                arguments[0].scrollBy({
+                    top: arguments[0].clientHeight * 2,
+                    behavior: 'auto'
+                });
+            """, scrollable_container)
+
+            # Also scroll the window
+            driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
+
+            # Very short wait for fast scrolling
+            time.sleep(0.5)
+
+            # Check if we've reached the end
+            current_height = driver.execute_script("return arguments[0].scrollHeight", scrollable_container)
+
+            if current_height == last_height:
+                no_change_count += 1
+                print(f"No new content loaded (attempt {no_change_count}/5)")
+            else:
+                no_change_count = 0
+                last_height = current_height
+
+            scroll_count += 1
+
+            if scroll_count % 10 == 0:
+                print(f"Scrolled {scroll_count} times...")
+
+        except Exception as e:
+            print(f"Error during fast scroll: {e}")
+            break
+
+    print(f"✅ Fast scrolling completed after {scroll_count} scrolls")
+    print("⏳ Waiting for all content to load...")
+    time.sleep(3)  # Wait for final content to load
+
+
+def extract_all_business_data(driver,location):
+    """Extract data from all loaded containers at once."""
+    print("📊 Extracting data from all loaded containers...")
+
+    # Find all business containers
+    container_selectors = [
+        "div[jsaction*='mouseover']",
+        "div.Nv2PK",
+        "div[data-value='business']",
+        ".hfpxzc"
+    ]
+
+    all_containers = []
+    for selector in container_selectors:
+        try:
+            containers = driver.find_elements(By.CSS_SELECTOR, selector)
+            if containers:
+                print(f"Found {len(containers)} containers with selector: {selector}")
+                all_containers = containers
+                break
+        except:
+            continue
+
+    if not all_containers:
+        print("❌ No business containers found!")
+        return []
+
+    print(f"🔍 Processing {len(all_containers)} containers...")
+    results = []
+    processed_businesses = set()
+    processed_links = set()
+
+    for i, container in enumerate(all_containers):
+        try:
+            # Show progress
+            if (i + 1) % 10 == 0:
+                print(f"Processed {i + 1}/{len(all_containers)} containers...")
+
+            # Extract business data
+            business_data = extract_business_data_from_container(container, debug=(i < 3))
+
+            if not business_data or not business_data.get('title'):
+                continue
+
+            # Create unique identifier
+            business_id = f"{business_data['title']}_{business_data['phone']}_{business_data['address'][:20] if business_data['address'] else ''}"
+            google_maps_link = business_data.get('google_maps_link', '')
+
+            # Skip if already processed
+            if (business_id in processed_businesses or
+                    (google_maps_link and google_maps_link in processed_links)):
+                continue
+
+            # Add to processed sets
+            processed_businesses.add(business_id)
+            if google_maps_link:
+                processed_links.add(google_maps_link)
+
+            # Store result
+            results.append({
+                'Title': business_data['title'],
+                'Address': business_data['address'],
+                'Phone': business_data['phone'],
+                'City':location,
+                'Business Type' : 'Tea stall / Tea shop',
+                'Rating': business_data['rating'],
+                'Reviews': business_data['review_count'],
+
+                'Industry': business_data['industry'],
+                'Website': business_data['company_url'],
+                'Google Maps Link': google_maps_link
+            })
+
+        except Exception as e:
+            print(f"Error processing container {i + 1}: {e}")
+            continue
+
+    print(f"✅ Successfully extracted {len(results)} unique businesses")
+    return results
+
+
+def scrape_data_fast_method(driver,location, url, max_scrolls=100):
+    """Fast scraping method: Scroll first, then extract all data."""
+    if not url.startswith("https://www.google.com/maps/search"):
+        print("Invalid URL. Please provide a Google Maps search URL.")
+        return []
+
+    print(f"🌐 Loading URL: {url}")
+    driver.get(url)
+    time.sleep(5)  # Wait for initial page load
+
+    # Step 1: Fast scroll to load all containers
+    fast_scroll_to_end(driver, max_scrolls)
+
+    # Step 2: Extract all data at once
+    results = extract_all_business_data(driver,location)
+
+    return results
+
+
+def save_to_excel(data, filename):
+    """Save scraped data to an Excel file."""
+    if not data:
+        print("No data to save.")
+        return False
+
+    try:
+        # Create DataFrame
+        df = pd.DataFrame(data, columns=['Title', 'Rating', 'Reviews', 'Phone', 'Industry', 'Address', 'Website',
+                                         'Google Maps Link'])
+
+        # Sanitize filename
+        filename = filename.strip()
+        if not filename.endswith('.xlsx'):
+            filename += '.xlsx'
+
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+
+        # 🔽 Save folder path
+        save_folder = "output_excel_files"  # <-- Change this path as needed
+        os.makedirs(save_folder, exist_ok=True)  # Ensure folder exists
+
+        # 📁 Full path to save
+        full_path = os.path.join(save_folder, filename)
+
+        # Save to Excel
+        df.to_excel(full_path, index=False, engine='openpyxl')
+        print(f"💾 Data saved to {full_path}")
+        return True
+
+    except Exception as e:
+        print(f"Error saving to Excel: {e}")
+        return False
+
+
+def process_multiple_urls_fast(urls_file_path):
+    tea_shop_urls = [
+        "https://www.google.com/maps/search/Tea+shop+in++Mumbai",
+        "https://www.google.com/maps/search/Tea+shop+in++Delhi",
+        "https://www.google.com/maps/search/Tea+shop+in++Bengaluru",
+        "https://www.google.com/maps/search/Tea+shop+in++Hyderabad",
+        "https://www.google.com/maps/search/Tea+shop+in++Ahmedabad",
+        "https://www.google.com/maps/search/Tea+shop+in++Chennai",
+        "https://www.google.com/maps/search/Tea+shop+in++Kolkata",
+        "https://www.google.com/maps/search/Tea+shop+in++Surat",
+        "https://www.google.com/maps/search/Tea+shop+in++Pune",
+        "https://www.google.com/maps/search/Tea+shop+in++Jaipur",
+        "https://www.google.com/maps/search/Tea+shop+in++Lucknow",
+        "https://www.google.com/maps/search/Tea+shop+in++Kanpur",
+        "https://www.google.com/maps/search/Tea+shop+in++Nagpur",
+        "https://www.google.com/maps/search/Tea+shop+in++Indore",
+        "https://www.google.com/maps/search/Tea+shop+in++Thane",
+        "https://www.google.com/maps/search/Tea+shop+in++Bhopal",
+        "https://www.google.com/maps/search/Tea+shop+in++Visakhapatnam",
+        "https://www.google.com/maps/search/Tea+shop+in++Patna",
+        "https://www.google.com/maps/search/Tea+shop+in++Vadodara",
+        "https://www.google.com/maps/search/Tea+shop+in++Ghaziabad",
+        "https://www.google.com/maps/search/Tea+shop+in++Ludhiana",
+        "https://www.google.com/maps/search/Tea+shop+in++Agra",
+        "https://www.google.com/maps/search/Tea+shop+in++Nashik",
+        "https://www.google.com/maps/search/Tea+shop+in++Faridabad",
+        "https://www.google.com/maps/search/Tea+shop+in++Meerut",
+        "https://www.google.com/maps/search/Tea+shop+in++Rajkot",
+        "https://www.google.com/maps/search/Tea+shop+in++Kalyan",
+        "https://www.google.com/maps/search/Tea+shop+in++Vasai",
+        "https://www.google.com/maps/search/Tea+shop+in++Varanasi",
+        "https://www.google.com/maps/search/Tea+shop+in++Srinagar",
+        "https://www.google.com/maps/search/Tea+shop+in++Aurangabad",
+        "https://www.google.com/maps/search/Tea+shop+in++Dhanbad",
+        "https://www.google.com/maps/search/Tea+shop+in++Amritsar",
+        "https://www.google.com/maps/search/Tea+shop+in++Navi+Mumbai",
+        "https://www.google.com/maps/search/Tea+shop+in++Prayagraj",
+        "https://www.google.com/maps/search/Tea+shop+in++Ranchi",
+        "https://www.google.com/maps/search/Tea+shop+in++Howrah",
+        "https://www.google.com/maps/search/Tea+shop+in++Coimbatore",
+        "https://www.google.com/maps/search/Tea+shop+in++Jabalpur",
+        "https://www.google.com/maps/search/Tea+shop+in++Gwalior",
+        "https://www.google.com/maps/search/Tea+shop+in++Vijayawada",
+        "https://www.google.com/maps/search/Tea+shop+in++Jodhpur",
+        "https://www.google.com/maps/search/Tea+shop+in++Madurai",
+        "https://www.google.com/maps/search/Tea+shop+in++Raipur",
+        "https://www.google.com/maps/search/Tea+shop+in++Kota",
+        "https://www.google.com/maps/search/Tea+shop+in++Guwahati",
+        "https://www.google.com/maps/search/Tea+shop+in++Chandigarh",
+        "https://www.google.com/maps/search/Tea+shop+in++Solapur",
+        "https://www.google.com/maps/search/Tea+shop+in++Hubli",
+        "https://www.google.com/maps/search/Tea+shop+in++Mysore",
+        "https://www.google.com/maps/search/Tea+shop+in++Tiruchirappalli",
+        "https://www.google.com/maps/search/Tea+shop+in++Bareilly",
+        "https://www.google.com/maps/search/Tea+shop+in++Aligarh",
+        "https://www.google.com/maps/search/Tea+shop+in++Tiruppur",
+        "https://www.google.com/maps/search/Tea+shop+in++Moradabad",
+        "https://www.google.com/maps/search/Tea+shop+in++Jalandhar",
+        "https://www.google.com/maps/search/Tea+shop+in++Bhubaneswar",
+        "https://www.google.com/maps/search/Tea+shop+in++Salem",
+        "https://www.google.com/maps/search/Tea+shop+in++Warangal",
+        "https://www.google.com/maps/search/Tea+shop+in++Guntur",
+        "https://www.google.com/maps/search/Tea+shop+in++Bhiwandi",
+        "https://www.google.com/maps/search/Tea+shop+in++Saharanpur",
+        "https://www.google.com/maps/search/Tea+shop+in++Gorakhpur",
+        "https://www.google.com/maps/search/Tea+shop+in++Bikaner",
+        "https://www.google.com/maps/search/Tea+shop+in++Amravati",
+        "https://www.google.com/maps/search/Tea+shop+in++Noida",
+        "https://www.google.com/maps/search/Tea+shop+in++Jamshedpur",
+        "https://www.google.com/maps/search/Tea+shop+in++Bhilai",
+        "https://www.google.com/maps/search/Tea+shop+in++Cuttack",
+        "https://www.google.com/maps/search/Tea+shop+in++Firozabad",
+        "https://www.google.com/maps/search/Tea+shop+in++Kochi",
+        "https://www.google.com/maps/search/Tea+shop+in++Nellore",
+        "https://www.google.com/maps/search/Tea+shop+in++Bhavnagar",
+        "https://www.google.com/maps/search/Tea+shop+in++Dehradun",
+        "https://www.google.com/maps/search/Tea+shop+in++Durgapur",
+        "https://www.google.com/maps/search/Tea+shop+in++Asansol",
+        "https://www.google.com/maps/search/Tea+shop+in++Rourkela",
+        "https://www.google.com/maps/search/Tea+shop+in++Nanded",
+        "https://www.google.com/maps/search/Tea+shop+in++Kolhapur",
+        "https://www.google.com/maps/search/Tea+shop+in++Ajmer",
+        "https://www.google.com/maps/search/Tea+shop+in++Akola",
+        "https://www.google.com/maps/search/Tea+shop+in++Gulbarga",
+        "https://www.google.com/maps/search/Tea+shop+in++Jamnagar",
+        "https://www.google.com/maps/search/Tea+shop+in++Ujjain",
+        "https://www.google.com/maps/search/Tea+shop+in++Loni",
+        "https://www.google.com/maps/search/Tea+shop+in++Siliguri",
+        "https://www.google.com/maps/search/Tea+shop+in++Jhansi",
+        "https://www.google.com/maps/search/Tea+shop+in++Ulhasnagar",
+        "https://www.google.com/maps/search/Tea+shop+in++Jammu",
+        "https://www.google.com/maps/search/Tea+shop+in++Sangli",
+        "https://www.google.com/maps/search/Tea+shop+in++Mangalore",
+        "https://www.google.com/maps/search/Tea+shop+in++Erode",
+        "https://www.google.com/maps/search/Tea+shop+in++Belgaum",
+        "https://www.google.com/maps/search/Tea+shop+in++Ambattur",
+        "https://www.google.com/maps/search/Tea+shop+in++Tirunelveli",
+        "https://www.google.com/maps/search/Tea+shop+in++Malegaon",
+        "https://www.google.com/maps/search/Tea+shop+in++Gaya",
+        "https://www.google.com/maps/search/Tea+shop+in++Udaipur",
+        "https://www.google.com/maps/search/Tea+shop+in++Maheshtala",
+        "https://www.google.com/maps/search/Tea+shop+in++Davanagere",
+        "https://www.google.com/maps/search/Tea+shop+in++Kozhikode",
+        "https://www.google.com/maps/search/Tea+shop+in++Kurnool",
+        "https://www.google.com/maps/search/Tea+shop+in++Rajahmundry",
+        "https://www.google.com/maps/search/Tea+shop+in++Bokaro",
+        "https://www.google.com/maps/search/Tea+shop+in++South+Dumdum"
+    ]
+
+    """Process multiple URLs using the fast method."""
+    if not os.path.exists(urls_file_path):
+        print(f"File {urls_file_path} not found!")
+        return
+
+    # Read URLs from file
+    with open(urls_file_path, 'r', encoding='utf-8') as f:
+        urls = [line.strip() for line in f.readlines() if line.strip()]
+
+    if not urls:
+        print("No URLs found in the file!")
+        return
+
+    print(f"🚀 FAST MODE: Found {len(urls)} URLs to process")
+    print("📋 Method: Scroll first → Extract all data at once")
+
+    driver = setup_driver()
+
+    try:
+        for i, url in enumerate(urls, 1):
+            print(f"\n{'=' * 80}")
+            print(f"🔄 Processing URL {i}/{len(urls)}")
+            print(f"🔗 {url}")
+            print(f"{'=' * 80}")
+            if url in tea_shop_urls:
+                continue
+            if not url.startswith("https://www.google.com/maps/search"):
+                print(f"❌ Skipping invalid URL: {url}")
+                continue
+
+            # Extract location name for filename
+            location_name = extract_location_from_url(url)
+            filename = f"{location_name}.xlsx"
+
+            print(f"💾 Will save as: {filename}")
+
+            # Record start time
+            start_time = time.time()
+
+            # Scrape data using fast method
+            results = scrape_data_fast_method(driver,location_name, url)
+
+            # Record end time
+            end_time = time.time()
+            duration = end_time - start_time
+
+            if results:
+                # Save to Excel
+                success = save_to_excel(results, filename)
+                if success:
+                    print(f"✅ Successfully processed {len(results)} businesses for {location_name}")
+                    print(f"⏱️ Time taken: {duration:.2f} seconds")
+                    print(f"⚡ Speed: {len(results) / duration:.2f} businesses/second")
+                else:
+                    print(f"❌ Failed to save data for {location_name}")
+            else:
+                print(f"❌ No results found for {url}")
+
+            # Wait between URLs to avoid being blocked
+            if i < len(urls):
+                print("⏳ Waiting 3 seconds before next URL...")
+                time.sleep(3)  # Reduced wait time
+
+    except KeyboardInterrupt:
+        print("\n⚠️ Scraping interrupted by user.")
+    except Exception as e:
+        print(f"❌ Error during batch processing: {e}")
+    finally:
+        driver.quit()
+        print("\n🎉 Fast batch processing completed!")
+
+
+def main():
+    """Main function to run the fast scraper."""
+    print("🚀 FAST Google Maps Scraper")
+    print("=" * 50)
+    print("📋 Method: Scroll Fast → Extract All Data")
+    print("⚡ Much faster than real-time processing!")
+    print("=" * 50)
+
+    urls_file = r"C:\Users\sanja\OneDrive\Documents\Tea shop in  Mumbai.txt"
+    process_multiple_urls_fast(urls_file)
+
+
+if __name__ == "__main__":
+    main()
